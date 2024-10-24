@@ -5,9 +5,11 @@
 #include <fmt/core.h>
 #include <libpldm/base.h>
 #include <libpldm/pldm.h>
+#include <libpldm/transport.h>
 
 #include <phosphor-logging/elog-errors.hpp>
 #include <phosphor-logging/log.hpp>
+#include <phosphor-logging/lg2.hpp>
 
 namespace openpower::dump::pldm
 {
@@ -57,6 +59,40 @@ std::string getService(sdbusplus::bus::bus& bus, const std::string& path,
 using NotAllowed = sdbusplus::xyz::openbmc_project::Common::Error::NotAllowed;
 using Reason = xyz::openbmc_project::Common::NotAllowed::REASON;
 
+pldm_instance_db* pldmInstanceIdDb = nullptr;
+
+PLDMInstanceManager::PLDMInstanceManager()
+{
+    initPLDMInstanceIdDb();
+}
+
+PLDMInstanceManager::~PLDMInstanceManager()
+{
+    destroyPLDMInstanceIdDb();
+}
+
+void PLDMInstanceManager::initPLDMInstanceIdDb()
+{
+    auto rc = pldm_instance_db_init_default(&pldmInstanceIdDb);
+    if (rc)
+    {
+        lg2::error("Error calling pldm_instance_db_init_default, rc = {RC}",
+                   "RC", rc);
+        elog<NotAllowed>(Reason(
+            "Required host dump action via pldm is not allowed due "
+            "to pldm_open failed"));
+    }
+}
+
+void PLDMInstanceManager::destroyPLDMInstanceIdDb()
+{
+    auto rc = pldm_instance_db_destroy(pldmInstanceIdDb);
+    if (rc)
+    {
+        lg2::error("pldm_instance_db_destroy failed rc = {RC}", "RC", rc);
+    }
+}
+
 int openPLDM()
 {
     auto fd = pldm_open();
@@ -72,22 +108,39 @@ int openPLDM()
     return fd;
 }
 
-uint8_t getPLDMInstanceID(uint8_t eid)
+pldm_instance_id_t getPLDMInstanceID(uint8_t tid)
 {
-    constexpr auto pldmRequester = "xyz.openbmc_project.PLDM.Requester";
-    constexpr auto pldm = "/xyz/openbmc_project/pldm";
+    pldm_instance_id_t instanceID = 0;
 
-    auto bus = sdbusplus::bus::new_default();
-    auto service = internal::getService(bus, pldm, pldmRequester);
+    auto rc = pldm_instance_id_alloc(pldmInstanceIdDb, tid, &instanceID);
+    if (rc == -EAGAIN)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        rc = pldm_instance_id_alloc(pldmInstanceIdDb, tid, &instanceID);
+    }
 
-    auto method = bus.new_method_call(service.c_str(), pldm, pldmRequester,
-                                      "GetInstanceId");
-    method.append(eid);
-    auto reply = bus.call(method);
-
-    uint8_t instanceID = 0;
-    reply.read(instanceID);
+    if (rc)
+    {
+        lg2::error("Failed to get instance id, rc = {RC}", "RC", rc);
+        elog<NotAllowed>(Reason(
+            "Failure in communicating with libpldm service, "
+            "service may not be running"));
+    }
+    lg2::info("Got instanceId: {INSTANCE_ID} from PLDM eid: {EID}",
+              "INSTANCE_ID", instanceID, "EID", tid);
 
     return instanceID;
 }
+
+void freePLDMInstanceID(pldm_instance_id_t instanceID, uint8_t tid)
+{
+    auto rc = pldm_instance_id_free(pldmInstanceIdDb, tid, instanceID);
+    if (rc)
+    {
+        lg2::error(
+            "pldm_instance_id_free failed to free id = {ID} of tid = {TID} rc = {RC}",
+            "ID", instanceID, "TID", tid, "RC", rc);
+    }
+}
+
 } // namespace openpower::dump::pldm
